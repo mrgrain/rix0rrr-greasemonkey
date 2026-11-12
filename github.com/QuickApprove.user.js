@@ -76,10 +76,11 @@ function scan() {
             $(`.${SECTION_CLASS}`).remove();
             return;
         }
-        const waiting = dedupeByRun([
-            ...yield waitingJobsFromStatusChecks(pr.url),
-            ...waitingJobsFromDom(),
-        ]).filter((job) => !approvedRuns.has(job.runId));
+        // Only look at the checks of the current head commit. Older runs (e.g. from
+        // the timeline) may still be waiting, but approving them is pointless.
+        const fromStatusChecks = yield waitingJobsFromStatusChecks(pr.url);
+        const waiting = dedupeByRun(fromStatusChecks.length > 0 ? fromStatusChecks : waitingJobsFromDom())
+            .filter((job) => !approvedRuns.has(job.runId));
         const pending = [];
         for (const job of waiting) {
             const info = yield approvalInfo(job.jobUrl);
@@ -157,8 +158,8 @@ function collectWaitingJobs(node, into) {
     values.forEach((v) => collectWaitingJobs(v, into));
 }
 /**
- * Fallback for when the status checks endpoint isn't available: check rows that
- * say "Waiting", and timeline deployment events labelled "Waiting".
+ * Fallback for when the status checks endpoint isn't available: check rows in
+ * the merge box that say "Waiting".
  */
 function waitingJobsFromDom() {
     const ret = [];
@@ -175,15 +176,6 @@ function waitingJobsFromDom() {
             }
         });
     }
-    $('span[title="Deployment Status Label: Waiting"]').each((_, label) => {
-        $(label).closest('.TimelineItem-body').find('a[href*="/actions/runs/"]').each((_, a) => {
-            var _a;
-            const href = (_a = $(a).attr('href')) !== null && _a !== void 0 ? _a : '';
-            if (JOB_URL_RE.test(href)) {
-                ret.push(waitingJob(href));
-            }
-        });
-    });
     return ret;
 }
 function waitingJob(url, name) {
@@ -291,7 +283,7 @@ function renderSection(anchor, pending) {
         return;
     }
     const section = $('<section>')
-        .addClass(`${SECTION_CLASS} d-flex flex-items-center gap-3 p-3`)
+        .addClass(`${SECTION_CLASS} d-flex flex-items-center gap-2 p-3`)
         .addClass(anchor.matches('section') ? 'border-bottom color-border-subtle' : 'branch-action-item')
         .attr('aria-label', 'Deployments')
         .attr('data-signature', signature);
