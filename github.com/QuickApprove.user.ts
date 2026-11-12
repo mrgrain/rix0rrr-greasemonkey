@@ -91,10 +91,11 @@ async function scan() {
     return;
   }
 
-  const waiting = dedupeByRun([
-    ...await waitingJobsFromStatusChecks(pr.url),
-    ...waitingJobsFromDom(),
-  ]).filter((job) => !approvedRuns.has(job.runId));
+  // Only look at the checks of the current head commit. Older runs (e.g. from
+  // the timeline) may still be waiting, but approving them is pointless.
+  const fromStatusChecks = await waitingJobsFromStatusChecks(pr.url);
+  const waiting = dedupeByRun(fromStatusChecks.length > 0 ? fromStatusChecks : waitingJobsFromDom())
+    .filter((job) => !approvedRuns.has(job.runId));
 
   const pending: PendingDeployment[] = [];
   for (const job of waiting) {
@@ -179,8 +180,8 @@ function collectWaitingJobs(node: unknown, into: WaitingJob[]) {
 }
 
 /**
- * Fallback for when the status checks endpoint isn't available: check rows that
- * say "Waiting", and timeline deployment events labelled "Waiting".
+ * Fallback for when the status checks endpoint isn't available: check rows in
+ * the merge box that say "Waiting".
  */
 function waitingJobsFromDom(): WaitingJob[] {
   const ret: WaitingJob[] = [];
@@ -197,15 +198,6 @@ function waitingJobsFromDom(): WaitingJob[] {
       }
     });
   }
-
-  $('span[title="Deployment Status Label: Waiting"]').each((_, label) => {
-    $(label).closest('.TimelineItem-body').find('a[href*="/actions/runs/"]').each((_, a) => {
-      const href = $(a).attr('href') ?? '';
-      if (JOB_URL_RE.test(href)) {
-        ret.push(waitingJob(href));
-      }
-    });
-  });
 
   return ret;
 }
@@ -325,7 +317,7 @@ function renderSection(anchor: HTMLElement, pending: PendingDeployment[]) {
   }
 
   const section = $('<section>')
-    .addClass(`${SECTION_CLASS} d-flex flex-items-center gap-3 p-3`)
+    .addClass(`${SECTION_CLASS} d-flex flex-items-center gap-2 p-3`)
     .addClass(anchor.matches('section') ? 'border-bottom color-border-subtle' : 'branch-action-item')
     .attr('aria-label', 'Deployments')
     .attr('data-signature', signature);
