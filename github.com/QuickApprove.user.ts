@@ -8,15 +8,13 @@
 // @match        https://github.com/*
 // ==/UserScript==
 
-const SECTION_CLASS = 'quick-approve-section';
+const BUTTONS_CLASS = 'quick-approve-buttons';
 const JOB_URL_RE = /\/[^/\s]+\/[^/\s]+\/actions\/runs\/(\d+)\/job\/(\d+)/;
-const STATUS_CHECKS_TTL_MS = 10_000;
 const APPROVAL_INFO_TTL_MS = 30_000;
 
 interface WaitingJob {
   readonly runId: string;
   readonly jobUrl: string;
-  readonly name?: string;
 }
 
 interface ApprovalInfo {
@@ -33,7 +31,6 @@ interface Cached<A> {
   readonly value: Promise<A>;
 }
 
-const statusChecksCache = new Map<string, Cached<WaitingJob[]>>();
 const approvalInfoCache = new Map<string, Cached<ApprovalInfo | undefined>>();
 const approvedRuns = new Set<string>();
 
@@ -41,9 +38,9 @@ let scanTimer: number | undefined;
 let scanning = false;
 let rescanRequested = false;
 
-// GitHub renders PR pages with a mix of Turbo navigations and React updates,
-// neither of which reliably announces itself. Watch the whole document and
-// rescan (debounced) whenever something changes.
+// GitHub renders PR pages with a mix of Turbo navigations, React updates and
+// live-updated partials, none of which reliably announces itself. Watch the
+// whole document and rescan (debounced) whenever something changes.
 new MutationObserver((mutations) => {
   if (mutations.every(isOwnMutation)) {
     return;
@@ -56,7 +53,7 @@ window.addEventListener('popstate', scheduleScan);
 scheduleScan();
 
 function isOwnMutation(m: MutationRecord) {
-  return m.target instanceof Element && m.target.closest(`.${SECTION_CLASS}`) !== null;
+  return m.target instanceof Element && m.target.closest(`.${BUTTONS_CLASS}`) !== null;
 }
 
 function scheduleScan() {
@@ -71,7 +68,9 @@ async function runScan() {
   }
   scanning = true;
   try {
-    await scan();
+    for (const box of findDeploymentBoxes()) {
+      await scanBox(box);
+    }
   } catch (e) {
     console.error('QuickApprove:', e);
   } finally {
@@ -83,19 +82,19 @@ async function runScan() {
   }
 }
 
-async function scan() {
-  const pr = currentPullRequest();
-  const anchors = pr ? findChecksSections() : [];
-  if (!pr || anchors.length === 0) {
-    $(`.${SECTION_CLASS}`).remove();
-    return;
-  }
+/**
+ * The "This branch is waiting for a deployment approval" boxes on the page
+ */
+function findDeploymentBoxes(): HTMLElement[] {
+  return $('.branch-action-item').filter((_, el) => $(el).find('.status-heading').length > 0
+    && $(el).find('.branch-action-item-icon .octicon-rocket').length > 0).get();
+}
 
-  // Only look at the checks of the current head commit. Older runs (e.g. from
-  // the timeline) may still be waiting, but approving them is pointless.
-  const fromStatusChecks = await waitingJobsFromStatusChecks(pr.url);
-  const waiting = dedupeByRun(fromStatusChecks.length > 0 ? fromStatusChecks : waitingJobsFromDom())
-    .filter((job) => !approvedRuns.has(job.runId));
+async function scanBox(box: HTMLElement) {
+  const heading = $(box).find('.status-heading').first();
+  const waiting = /waiting/i.test(heading.text())
+    ? waitingJobsInBox(box).filter((job) => !approvedRuns.has(job.runId))
+    : [];
 
   const pending: PendingDeployment[] = [];
   for (const job of waiting) {
@@ -105,118 +104,29 @@ async function scan() {
     }
   }
 
-  // The DOM may have changed while we were fetching
-  for (const anchor of findChecksSections()) {
-    renderSection(anchor, pending);
-  }
-}
-
-function currentPullRequest() {
-  const m = window.location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
-  return m ? { url: `/${m[1]}/${m[2]}/pull/${m[3]}` } : undefined;
+  renderButtons(box, pending);
 }
 
 /**
- * The elements to put our section in front of
- *
- * - New (React) merge box: `<section aria-label="Checks">`, inline and in the "Merge status" panel.
- * - Classic merge box: the `.branch-action-item` that holds the checks list.
+ * The jobs linked from the environment rows of a deployments box, one per run
  */
-function findChecksSections(): HTMLElement[] {
-  const react = $('section[aria-label="Checks"]').get();
-  const classic = $('.merge-status-list').closest('.branch-action-item').get();
-  return [...react, ...classic];
-}
-
-/**
- * Ask GitHub for the PR's status checks, the same way the merge box does.
- *
- * We don't depend on the exact response shape: any object that has a `WAITING`
- * value and a link to an Actions job counts as a job waiting for a deployment.
- */
-function waitingJobsFromStatusChecks(prUrl: string): Promise<WaitingJob[]> {
-  return cached(statusChecksCache, prUrl, STATUS_CHECKS_TTL_MS, async () => {
-    try {
-      const response = await fetch(`${prUrl}/page_data/status_checks`, {
-        headers: {
-          'Accept': 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-          'GitHub-Verified-Fetch': 'true',
-          'GitHub-Is-React': 'true',
-        },
-      });
-      if (!response.ok) {
-        return [];
-      }
-      const ret: WaitingJob[] = [];
-      collectWaitingJobs(await response.json(), ret);
-      return ret;
-    } catch (e) {
-      console.warn('QuickApprove: could not fetch status checks', e);
-      return [];
-    }
-  });
-}
-
-function collectWaitingJobs(node: unknown, into: WaitingJob[]) {
-  if (Array.isArray(node)) {
-    node.forEach((x) => collectWaitingJobs(x, into));
-    return;
-  }
-  if (!node || typeof node !== 'object') {
-    return;
-  }
-
-  const obj = node as Record<string, unknown>;
-  const values = Object.keys(obj).map((k) => obj[k]);
-  const isWaiting = values.some((v) => typeof v === 'string' && v.toUpperCase() === 'WAITING');
-  const jobUrl = values.find((v): v is string => typeof v === 'string' && JOB_URL_RE.test(v));
-  if (isWaiting && jobUrl) {
-    const name = [obj.displayName, obj.name].find((v): v is string => typeof v === 'string');
-    into.push(waitingJob(jobUrl, name));
-  }
-
-  values.forEach((v) => collectWaitingJobs(v, into));
-}
-
-/**
- * Fallback for when the status checks endpoint isn't available: check rows in
- * the merge box that say "Waiting".
- */
-function waitingJobsFromDom(): WaitingJob[] {
-  const ret: WaitingJob[] = [];
-
-  for (const section of findChecksSections()) {
-    $(section).find('a[href*="/actions/runs/"]').each((_, a) => {
-      const href = $(a).attr('href') ?? '';
-      if (!JOB_URL_RE.test(href)) {
-        return;
-      }
-      const row = $(a).closest('li, [role="listitem"], .merge-status-item');
-      if (/\bWaiting\b/.test(row.text())) {
-        ret.push(waitingJob(href, $(a).text().trim() || undefined));
-      }
-    });
-  }
-
-  return ret;
-}
-
-function waitingJob(url: string, name?: string): WaitingJob {
-  const jobUrl = new URL(url, window.location.origin);
-  jobUrl.search = '';
-  return { runId: jobUrl.pathname.match(JOB_URL_RE)![1], jobUrl: jobUrl.toString(), name };
-}
-
-function dedupeByRun(jobs: WaitingJob[]): WaitingJob[] {
+function waitingJobsInBox(box: HTMLElement): WaitingJob[] {
   const byRun = new Map<string, WaitingJob>();
-  for (const job of jobs) {
-    const existing = byRun.get(job.runId);
-    if (!existing || (!existing.name && job.name)) {
+  $(box).find('.merge-status-list a[href*="/actions/runs/"]').each((_, a) => {
+    const href = $(a).attr('href') ?? '';
+    if (JOB_URL_RE.test(href)) {
+      const job = waitingJob(href);
       byRun.set(job.runId, job);
     }
-  }
+  });
   return Array.from(byRun.values());
+}
+
+function waitingJob(url: string): WaitingJob {
+  const jobUrl = new URL(url, window.location.origin);
+  jobUrl.search = '';
+  const runId = jobUrl.pathname.match(JOB_URL_RE)?.[1] ?? '';
+  return { runId, jobUrl: jobUrl.toString() };
 }
 
 /**
@@ -253,11 +163,12 @@ async function approve(job: PendingDeployment) {
   // Always use a fresh form, the token in a cached one may have expired
   approvalInfoCache.delete(job.jobUrl);
   const info = await approvalInfo(job.jobUrl);
-  if (!info) {
+  const action = info?.form.getAttribute('action');
+  if (!info || !action) {
     throw new Error(`Nothing to approve for ${job.jobUrl}`);
   }
 
-  const response = await fetch(info.form.getAttribute('action')!, {
+  const response = await fetch(action, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: collectFormData(info.form),
@@ -268,7 +179,6 @@ async function approve(job: PendingDeployment) {
 
   approvedRuns.add(job.runId);
   approvalInfoCache.delete(job.jobUrl);
-  statusChecksCache.clear();
 }
 
 /**
@@ -299,11 +209,17 @@ function collectFormData(form: HTMLFormElement) {
   return ret;
 }
 
-function renderSection(anchor: HTMLElement, pending: PendingDeployment[]) {
-  const existing = $(anchor).prevAll(`.${SECTION_CLASS}`).first();
+/**
+ * Put a row of approve buttons, right aligned, below the text of the box
+ */
+function renderButtons(box: HTMLElement, pending: PendingDeployment[]) {
+  const existing = $(box).find(`.${BUTTONS_CLASS}`);
 
   if (pending.length === 0) {
-    existing.remove();
+    // Keep showing the result of an approval until the box updates
+    if (existing.find('button[data-done]').length === 0) {
+      existing.remove();
+    }
     return;
   }
 
@@ -311,52 +227,25 @@ function renderSection(anchor: HTMLElement, pending: PendingDeployment[]) {
   if (existing.length > 0 && existing.attr('data-signature') === signature) {
     return;
   }
-  // Don't replace a section while an approval is running in it
+  // Don't replace buttons while an approval is running
   if (existing.find('button[data-busy]').length > 0) {
     return;
   }
 
-  const section = $('<section>')
-    .addClass(`${SECTION_CLASS} d-flex flex-items-center gap-2 p-3`)
-    .addClass(anchor.matches('section') ? 'border-bottom color-border-subtle' : 'branch-action-item')
-    .attr('aria-label', 'Deployments')
+  const row = $('<div>')
+    .addClass(`${BUTTONS_CLASS} d-flex flex-wrap flex-justify-end gap-2 mt-2`)
     .attr('data-signature', signature);
-
-  section.append($('<div>')
-    .addClass('d-flex flex-items-center flex-justify-center flex-shrink-0 circle')
-    .css({
-      width: '32px',
-      height: '32px',
-      color: 'var(--fgColor-onEmphasis, #fff)',
-      backgroundColor: 'var(--bgColor-attention-emphasis, #9a6700)',
-    })
-    .html(ROCKET_ICON));
-
-  const plural = pending.length > 1 || pending[0].environments.length > 1;
-  const subtitle = $('<div>').addClass('fgColor-muted color-fg-muted');
-  pending.forEach((p, i) => {
-    subtitle.append(
-      i > 0 ? ', ' : '',
-      $('<a>').addClass('Link--secondary').attr({ href: p.jobUrl, target: '_blank' }).text(p.name ?? `run ${p.runId}`),
-    );
-  });
-  subtitle.append(pending.length > 1 ? ' are waiting for a reviewer.' : ' is waiting for a reviewer.');
-
-  section.append($('<div>').addClass('flex-auto').append(
-    $('<h3>').addClass('h4').text(plural ? 'Some deployments are waiting for approval' : 'A deployment is waiting for approval'),
-    subtitle,
-  ));
-
-  const buttons = $('<div>').addClass('d-flex flex-column flex-md-row flex-shrink-0 gap-2');
   for (const p of pending) {
-    buttons.append(approveButton(p));
+    row.append(approveButton(p));
   }
-  section.append(buttons);
 
+  const meta = $(box).find('.status-meta').first();
   if (existing.length > 0) {
-    existing.replaceWith(section);
+    existing.replaceWith(row);
+  } else if (meta.length > 0) {
+    meta.after(row);
   } else {
-    $(anchor).before(section);
+    $(box).find('.status-heading').first().after(row);
   }
 }
 
@@ -378,8 +267,7 @@ function approveButton(p: PendingDeployment) {
       try {
         await approve(p);
         status.text('✅ ');
-        btn.removeAttr('data-busy');
-        window.setTimeout(scheduleScan, 3000);
+        btn.removeAttr('data-busy').attr('data-done', 'true');
       } catch (e) {
         console.error('QuickApprove:', e);
         status.text('❌ ');
@@ -398,5 +286,3 @@ function cached<A>(cache: Map<string, Cached<A>>, key: string, ttl: number, fn: 
   value.catch(() => cache.delete(key));
   return value;
 }
-
-const ROCKET_ICON = '<svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16" fill="currentColor"><path d="M14.064 0h.186C15.216 0 16 .784 16 1.75v.186a8.752 8.752 0 0 1-2.564 6.186l-.458.459c-.314.314-.641.616-.979.904v3.207c0 .608-.315 1.172-.833 1.49l-2.774 1.707a.749.749 0 0 1-1.11-.418l-.954-3.102a1.214 1.214 0 0 1-.145-.125L3.754 9.816a1.218 1.218 0 0 1-.124-.145L.528 8.717a.749.749 0 0 1-.418-1.11l1.71-2.774A1.748 1.748 0 0 1 3.31 4h3.204c.288-.338.59-.665.904-.979l.459-.458A8.749 8.749 0 0 1 14.064 0ZM8.938 3.623h-.002l-.458.458c-.76.76-1.437 1.598-2.02 2.5l-1.5 2.317 2.143 2.143 2.317-1.5c.902-.583 1.74-1.26 2.499-2.02l.459-.458a7.25 7.25 0 0 0 2.123-5.127V1.75a.25.25 0 0 0-.25-.25h-.186a7.249 7.249 0 0 0-5.125 2.123ZM3.56 14.56c-.732.732-2.334 1.045-3.005 1.148a.234.234 0 0 1-.201-.064.234.234 0 0 1-.064-.201c.103-.671.416-2.273 1.15-3.003a1.502 1.502 0 1 1 2.12 2.12Zm6.94-3.935c-.088.06-.177.118-.266.175l-2.35 1.521.548 1.783 1.949-1.2a.25.25 0 0 0 .119-.213ZM3.678 8.116 5.2 5.766c.058-.09.117-.178.176-.266H3.309a.25.25 0 0 0-.213.119l-1.2 1.95ZM12 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path></svg>';
